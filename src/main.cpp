@@ -17,14 +17,25 @@
 Adafruit_SSD1306 oledPantalla(ANCHO_PANTALLA, ALTO_PANTALLA, &Wire, OLED_RESET);
 
 // -----------------------------
-// CONFIGURACIÓN DE PINES Y SENSORES
+// CONFIGURACIÓN DE IDENTIFICACIÓN DE SENSORES
 // -----------------------------
-#define PIN_DHT 4
-#define TIPO_DHT DHT11
-const int PIN_TRIG = 5;
-const int PIN_ECHO = 18;
+// Pin ADC para leer el divisor de voltaje (empezamos con 1 puerto)
+const int PIN_ID_SENSOR = 34; // Puerto RJ45 #1
 
-DHT dhtSensor(PIN_DHT, TIPO_DHT);
+// Pines para el DHT11 cuando se detecte
+const int PIN_DHT_DATOS = 4;
+
+// Rangos de voltaje para identificación (en mV)
+// Con alimentación de 5V y divisor 330Ω + 330Ω = ~2500mV (2.5V nominal)
+// Tolerancia: ±10% por variación en resistencias y voltaje de alimentación
+const int VOLTAJE_MIN_DHT11 = 2100;  // Mínimo 2.1V (margen amplio)
+const int VOLTAJE_MAX_DHT11 = 2900;  // Máximo 2.9V (margen amplio)
+const int VOLTAJE_SIN_SENSOR = 300;   // Menor a 0.3V = sin sensor
+
+// Estado del sensor
+String tipoSensorActual = "NINGUNO";
+DHT* sensorDHT = nullptr;
+bool sensorActivo = false;
 
 // -----------------------------
 // CONFIGURACIÓN DEL SERVIDOR WEB
@@ -39,21 +50,22 @@ WebServer servidorWeb(8080);
 #define UUID_CARACT_PASS "beb5483e-36e1-4688-b7f5-ea07361b26a9"
 #define UUID_CARACT_ESTADO "beb5483e-36e1-4688-b7f5-ea07361b26aa"
 
-// Variables globales
 String ssidWiFi = "";
 String contrasenaWiFi = "";
 bool credencialesGuardadas = false;
 String nombreDispositivoBLE;
-
 BLECharacteristic *caracteristicaBLEEstado;
 
 // -----------------------------
 // DECLARACIÓN DE FUNCIONES
 // -----------------------------
-void enviarDatosDHT();
-void enviarDatosUltrasonico();
+void detectarSensor();
+String identificarSensor();
+int leerVoltajeADC();
+void configurarDHT11();
 void responderPaginaInicio();
-float obtenerDistanciaUltrasonico();
+void responderDatosSensor();
+void responderVoltaje();
 bool intentarConexionWiFi();
 void configurarServidorWeb();
 
@@ -66,10 +78,8 @@ class ServidorBLECallbacks : public BLEServerCallbacks {
         if (credencialesGuardadas) {
             String ip = WiFi.localIP().toString();
             caracteristicaBLEEstado->setValue(("IP:" + ip).c_str());
-            Serial.println("Enviando IP por BLE: " + ip);
         }
     }
-
     void onDisconnect(BLEServer *pServidor) {
         Serial.println("Dispositivo desconectado, reiniciando publicidad BLE");
         BLEDevice::startAdvertising();
@@ -82,8 +92,6 @@ class SSIDCallback : public BLECharacteristicCallbacks {
             String ip = WiFi.localIP().toString();
             caracteristicaBLEEstado->setValue(("IP:" + ip).c_str());
             caracteristicaBLEEstado->notify();
-            Serial.println("Ya está configurado, enviando IP: " + ip);
-            delay(100);
             return;
         }
         ssidWiFi = pCaracteristica->getValue().c_str();
@@ -97,13 +105,10 @@ class PasswordCallback : public BLECharacteristicCallbacks {
             String ip = WiFi.localIP().toString();
             caracteristicaBLEEstado->setValue(("IP:" + ip).c_str());
             caracteristicaBLEEstado->notify();
-            Serial.println("Ya está configurado, enviando IP: " + ip);
-            delay(100);
             return;
         }
-
         contrasenaWiFi = pCaracteristica->getValue().c_str();
-        Serial.println("Contraseña recibida: " + contrasenaWiFi);
+        Serial.println("Contraseña recibida");
 
         if (ssidWiFi != "" && contrasenaWiFi != "") {
             if (intentarConexionWiFi()) {
@@ -111,20 +116,10 @@ class PasswordCallback : public BLECharacteristicCallbacks {
                 String ip = WiFi.localIP().toString();
                 caracteristicaBLEEstado->setValue(("IP:" + ip).c_str());
                 caracteristicaBLEEstado->notify();
-                Serial.println("WiFi conectado, IP: " + ip);
-                delay(100);
                 configurarServidorWeb();
             } else {
-                String error = "Error WiFi";
-                caracteristicaBLEEstado->setValue(error.c_str());
+                caracteristicaBLEEstado->setValue("Error WiFi");
                 caracteristicaBLEEstado->notify();
-                Serial.println("Fallo la conexión WiFi");
-                oledPantalla.clearDisplay();
-                oledPantalla.setCursor(0, 0);
-                oledPantalla.println("Error WiFi");
-                oledPantalla.println("Ver credenciales");
-                oledPantalla.display();
-                delay(100);
             }
         }
     }
@@ -135,11 +130,15 @@ class PasswordCallback : public BLECharacteristicCallbacks {
 // -----------------------------
 void setup() {
     Serial.begin(115200);
-    pinMode(PIN_TRIG, OUTPUT);
-    pinMode(PIN_ECHO, INPUT);
-    dhtSensor.begin();
     delay(1000);
+    
+    Serial.println("\n\n=================================");
+    Serial.println("SISTEMA DE DETECCIÓN DE SENSORES");
+    Serial.println("=================================\n");
 
+    // Configurar pin de identificación como entrada
+    pinMode(PIN_ID_SENSOR, INPUT);
+    
     if (!oledPantalla.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
         Serial.println("Error al iniciar OLED");
         while (true);
@@ -149,13 +148,19 @@ void setup() {
     oledPantalla.setTextSize(1);
     oledPantalla.setTextColor(SSD1306_WHITE);
     oledPantalla.setCursor(0, 0);
-    oledPantalla.println("Iniciando sistema...");
+    oledPantalla.println("Sistema Sensor");
+    oledPantalla.println("Detectando...");
     oledPantalla.display();
 
+    // Detectar sensor inicial
+    Serial.println("Leyendo voltaje del divisor...");
+    delay(500);
+    detectarSensor();
+
+    // Configurar BLE
     String mac = WiFi.macAddress();
     nombreDispositivoBLE = "ESP32_Sensor_" + mac.substring(mac.length() - 5);
     nombreDispositivoBLE.replace(":", "");
-    Serial.println("Nombre BLE: " + nombreDispositivoBLE);
 
     BLEDevice::init(nombreDispositivoBLE.c_str());
     BLEServer *servidorBLE = BLEDevice::createServer();
@@ -176,14 +181,16 @@ void setup() {
     BLEAdvertising *publicidad = BLEDevice::getAdvertising();
     publicidad->addServiceUUID(UUID_SERVICIO);
     publicidad->setScanResponse(true);
-    publicidad->setMinPreferred(0x06);
     BLEDevice::startAdvertising();
 
-    Serial.println("BLE listo");
+    Serial.println("\nBLE iniciado: " + nombreDispositivoBLE);
+    
     oledPantalla.clearDisplay();
     oledPantalla.setCursor(0, 0);
-    oledPantalla.println("Conecta via BLE");
+    oledPantalla.println("BLE Activo");
     oledPantalla.println(nombreDispositivoBLE);
+    oledPantalla.println("");
+    oledPantalla.println("Sensor: " + tipoSensorActual);
     oledPantalla.display();
 }
 
@@ -191,20 +198,18 @@ void setup() {
 // BUCLE PRINCIPAL
 // -----------------------------
 void loop() {
+    // Detectar cambios en sensor cada 3 segundos
+    static unsigned long ultimaDeteccion = 0;
+    if (millis() - ultimaDeteccion > 3000) {
+        detectarSensor();
+        ultimaDeteccion = millis();
+    }
+
     if (credencialesGuardadas) {
         servidorWeb.handleClient();
         if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("WiFi desconectado, reintentando...");
             if (!intentarConexionWiFi()) {
                 credencialesGuardadas = false;
-                caracteristicaBLEEstado->setValue("WiFi desconectado");
-                caracteristicaBLEEstado->notify();
-                oledPantalla.clearDisplay();
-                oledPantalla.setCursor(0, 0);
-                oledPantalla.println("WiFi desconectado");
-                oledPantalla.println("Reconfigura BLE");
-                oledPantalla.display();
-                delay(100);
             }
         }
     }
@@ -212,87 +217,202 @@ void loop() {
 }
 
 // -----------------------------
+// FUNCIONES DE DETECCIÓN DE SENSORES
+// -----------------------------
+void detectarSensor() {
+    String tipoDetectado = identificarSensor();
+    
+    if (tipoDetectado != tipoSensorActual) {
+        Serial.println("\n--- CAMBIO DE SENSOR DETECTADO ---");
+        Serial.println("Anterior: " + tipoSensorActual);
+        Serial.println("Nuevo: " + tipoDetectado);
+        
+        // Limpiar sensor anterior
+        if (sensorDHT != nullptr) {
+            delete sensorDHT;
+            sensorDHT = nullptr;
+        }
+        
+        tipoSensorActual = tipoDetectado;
+        sensorActivo = false;
+        
+        // Configurar nuevo sensor
+        if (tipoDetectado == "DHT11") {
+            configurarDHT11();
+            sensorActivo = true;
+            Serial.println("DHT11 configurado y activo");
+        }
+        
+        // Actualizar pantalla
+        oledPantalla.clearDisplay();
+        oledPantalla.setCursor(0, 0);
+        
+        if (credencialesGuardadas) {
+            oledPantalla.println("WiFi OK");
+            oledPantalla.println("IP:" + WiFi.localIP().toString().substring(0,15));
+        } else {
+            oledPantalla.println("BLE: " + nombreDispositivoBLE.substring(0,15));
+        }
+        
+        oledPantalla.println("");
+        oledPantalla.print("Sensor: ");
+        oledPantalla.println(tipoSensorActual);
+        
+        int voltaje = leerVoltajeADC();
+        oledPantalla.print("V: ");
+        oledPantalla.print(voltaje);
+        oledPantalla.println(" mV");
+        
+        oledPantalla.display();
+    }
+}
+
+String identificarSensor() {
+    int voltajeMV = leerVoltajeADC();
+    
+    // Mostrar voltaje en Serial cada vez
+    Serial.print("Voltaje leído: ");
+    Serial.print(voltajeMV);
+    Serial.print(" mV (");
+    Serial.print(voltajeMV / 1000.0, 2);
+    Serial.println(" V)");
+    
+    // Identificar según rango
+    if (voltajeMV < VOLTAJE_SIN_SENSOR) {
+        Serial.println("  -> Sin sensor conectado");
+        return "NINGUNO";
+    } 
+    else if (voltajeMV >= VOLTAJE_MIN_DHT11 && voltajeMV <= VOLTAJE_MAX_DHT11) {
+        Serial.println("  -> DHT11 detectado!");
+        return "DHT11";
+    } 
+    else {
+        Serial.println("  -> Voltaje desconocido");
+        Serial.println("  -> Ajusta los rangos en el código");
+        return "DESCONOCIDO";
+    }
+}
+
+int leerVoltajeADC() {
+    // Hacer múltiples lecturas para mayor precisión
+    long suma = 0;
+    const int NUM_LECTURAS = 10;
+    
+    for (int i = 0; i < NUM_LECTURAS; i++) {
+        suma += analogRead(PIN_ID_SENSOR);
+        delay(10);
+    }
+    
+    int valorADC = suma / NUM_LECTURAS;
+    
+    // Convertir a milivoltios
+    // Si el ADC está saturado (>4000), el voltaje real es mayor a 3.3V
+    int voltajeMV = (valorADC * 3300) / 4095;
+    
+    return voltajeMV;
+}
+
+void configurarDHT11() {
+    sensorDHT = new DHT(PIN_DHT_DATOS, DHT11);
+    sensorDHT->begin();
+    delay(2000); // DHT11 necesita tiempo para inicializar
+}
+
+// -----------------------------
 // FUNCIONES DEL SERVIDOR WEB
 // -----------------------------
 void configurarServidorWeb() {
-    Serial.println("Iniciando servidor web...");
-    servidorWeb.on("/inicio", responderPaginaInicio);
-    servidorWeb.on("/sensor/dht", enviarDatosDHT);
-    servidorWeb.on("/sensor/ultrasonico", enviarDatosUltrasonico);
+    servidorWeb.on("/", responderPaginaInicio);
+    servidorWeb.on("/datos", responderDatosSensor);
+    servidorWeb.on("/voltaje", responderVoltaje);
     servidorWeb.begin();
-    Serial.println("Servidor iniciado en IP: " + WiFi.localIP().toString());
-
-    oledPantalla.clearDisplay();
-    oledPantalla.setCursor(0, 0);
-    oledPantalla.println("WiFi conectado");
-    oledPantalla.print("IP: ");
-    oledPantalla.println(WiFi.localIP().toString());
-    oledPantalla.display();
+    Serial.println("\n=== Servidor web iniciado ===");
+    Serial.println("IP: " + WiFi.localIP().toString());
+    Serial.println("Prueba:");
+    Serial.println("  http://" + WiFi.localIP().toString() + "/");
+    Serial.println("  http://" + WiFi.localIP().toString() + "/datos");
+    Serial.println("  http://" + WiFi.localIP().toString() + "/voltaje");
 }
 
 void responderPaginaInicio() {
-    servidorWeb.send(200, "text/plain", "Servidor ESP32 activo. Usa /sensor/dht o /sensor/ultrasonico.");
+    String html = "<!DOCTYPE html><html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<title>ESP32 Sensor Hub</title>";
+    html += "<style>body{font-family:Arial;margin:20px;background:#f0f0f0;}";
+    html += ".card{background:white;padding:20px;margin:10px 0;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}";
+    html += "h1{color:#333;}a{color:#007bff;text-decoration:none;font-size:18px;display:block;margin:10px 0;}";
+    html += "a:hover{text-decoration:underline;}</style></head><body>";
+    html += "<div class='card'><h1>🔌 ESP32 Sensor Hub</h1>";
+    html += "<p><strong>Sensor detectado:</strong> " + tipoSensorActual + "</p>";
+    html += "<p><strong>Estado:</strong> " + String(sensorActivo ? "Activo ✅" : "Inactivo ❌") + "</p>";
+    html += "</div><div class='card'>";
+    html += "<h2>📊 Endpoints disponibles:</h2>";
+    html += "<a href='/datos'>📈 Ver datos del sensor</a>";
+    html += "<a href='/voltaje'>⚡ Ver voltaje del divisor</a>";
+    html += "</div></body></html>";
+    servidorWeb.send(200, "text/html", html);
 }
 
-void enviarDatosDHT() {
-    float humedad = dhtSensor.readHumidity();
-    float temperatura = dhtSensor.readTemperature();
-    if (isnan(humedad) || isnan(temperatura)) {
-        servidorWeb.send(500, "application/json", "{\"error\": \"Error DHT11\"}");
-        return;
+void responderDatosSensor() {
+    String json = "{";
+    json += "\"sensor\": \"" + tipoSensorActual + "\",";
+    json += "\"activo\": " + String(sensorActivo ? "true" : "false");
+    
+    if (sensorActivo && tipoSensorActual == "DHT11" && sensorDHT != nullptr) {
+        float temp = sensorDHT->readTemperature();
+        float hum = sensorDHT->readHumidity();
+        
+        if (!isnan(temp) && !isnan(hum)) {
+            json += ",\"temperatura\": " + String(temp, 1);
+            json += ",\"humedad\": " + String(hum, 1);
+            json += ",\"unidades\": {\"temperatura\": \"°C\", \"humedad\": \"%\"}";
+        } else {
+            json += ",\"error\": \"Error al leer DHT11\"";
+        }
+    } else if (!sensorActivo) {
+        json += ",\"mensaje\": \"No hay sensor activo\"";
     }
-    String json = "{\"temperatura\": " + String(temperatura) + ", \"humedad\": " + String(humedad) + "}";
+    
+    json += "}";
     servidorWeb.send(200, "application/json", json);
 }
 
-void enviarDatosUltrasonico() {
-    float distancia = obtenerDistanciaUltrasonico();
-    if (distancia == -1) {
-        servidorWeb.send(500, "application/json", "{\"error\": \"Error ultrasónico\"}");
-        return;
-    }
-    String json = "{\"distancia\": " + String(distancia) + "}";
+void responderVoltaje() {
+    int voltaje = leerVoltajeADC();
+    String json = "{";
+    json += "\"voltaje_mv\": " + String(voltaje);
+    json += ",\"voltaje_v\": " + String(voltaje / 1000.0, 3);
+    json += ",\"sensor_detectado\": \"" + tipoSensorActual + "\"";
+    json += ",\"rango_dht11\": {\"min\": " + String(VOLTAJE_MIN_DHT11) + ", \"max\": " + String(VOLTAJE_MAX_DHT11) + "}";
+    json += "}";
     servidorWeb.send(200, "application/json", json);
-}
-
-float obtenerDistanciaUltrasonico() {
-    digitalWrite(PIN_TRIG, LOW);
-    delayMicroseconds(2);
-    digitalWrite(PIN_TRIG, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(PIN_TRIG, LOW);
-    int duracion = pulseIn(PIN_ECHO, HIGH);
-    if (duracion == 0) return -1;
-    return duracion * 0.0343 / 2;
 }
 
 bool intentarConexionWiFi() {
     WiFi.disconnect(true);
     WiFi.begin(ssidWiFi.c_str(), contrasenaWiFi.c_str());
-    Serial.print("Conectando a WiFi: " + ssidWiFi + "...");
+    
+    Serial.print("\nConectando a WiFi");
     oledPantalla.clearDisplay();
     oledPantalla.setCursor(0, 0);
-    oledPantalla.println("Conectando WiFi");
+    oledPantalla.println("Conectando WiFi...");
     oledPantalla.println(ssidWiFi);
     oledPantalla.display();
-
+    
     int intentos = 0;
     while (WiFi.status() != WL_CONNECTED && intentos < 20) {
         delay(500);
         Serial.print(".");
         intentos++;
     }
-
+    
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\nConectado. IP: " + WiFi.localIP().toString());
+        Serial.println("\n✅ WiFi conectado!");
+        Serial.println("IP: " + WiFi.localIP().toString());
         return true;
     } else {
-        Serial.println("\nError al conectar WiFi");
-        oledPantalla.clearDisplay();
-        oledPantalla.setCursor(0, 0);
-        oledPantalla.println("Error WiFi");
-        oledPantalla.println("Ver credenciales");
-        oledPantalla.display();
+        Serial.println("\n❌ Error al conectar WiFi");
         return false;
     }
 }
